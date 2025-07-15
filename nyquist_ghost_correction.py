@@ -87,6 +87,37 @@ def oneDimLinearCorr_entropy(epi_kxkyzc_raw, nShot):
 
     return epi_kxkyzc_lpcCor, phasepara
 
+def oneDimConstCorr_entropy(epi_kxkyzc_raw, nShot):
+    org_size = epi_kxkyzc_raw.shape
+
+    if len(epi_kxkyzc_raw.shape) < 4:
+        epi_kxkyzc_raw = epi_kxkyzc_raw.reshape(epi_kxkyzc_raw.shape[0], epi_kxkyzc_raw.shape[1], 1, epi_kxkyzc_raw.shape[2])
+
+    epi_kxkyzc_cpcCor = np.zeros_like(epi_kxkyzc_raw)
+    phasepara_const = np.zeros((epi_kxkyzc_cpcCor.shape[2], nShot-1))
+    nSlice = epi_kxkyzc_cpcCor.shape[2]
+    assert epi_kxkyzc_cpcCor.shape[1]%2==0, "number of phase encoding must be a even number"
+    middleSliceIndex = nSlice // 2
+
+    import tqdm
+    for iSlice in tqdm.tqdm(list(range(middleSliceIndex, nSlice)) + list(range(middleSliceIndex - 1, -1, -1))):
+        # print(iSlice)
+        
+        data_kyxc = fftshift(fft(np.transpose(epi_kxkyzc_raw[:, :, iSlice, :], (1, 0, 2)), axis=1), axes=1)
+
+        if iSlice == middleSliceIndex:
+            CorxKy_en, phasepara_const[iSlice, :] = OCEntropyBasedCor_forCompile(data_kyxc, nShot, None)
+        elif iSlice > middleSliceIndex:
+            CorxKy_en, phasepara_const[iSlice, :] = OCEntropyBasedCor_forCompile(data_kyxc, nShot, phasepara_const[iSlice - 1, :])
+        else:
+            CorxKy_en, phasepara_const[iSlice, :] = OCEntropyBasedCor_forCompile(data_kyxc, nShot, phasepara_const[iSlice + 1, :])
+
+        epi_kxkyzc_cpcCor[:, :, iSlice, :] = np.transpose(ifft(fftshift(CorxKy_en, axes=1), axis=1), (1, 0, 2))
+
+    epi_kxkyzc_cpcCor = epi_kxkyzc_cpcCor.reshape(org_size)
+
+    return epi_kxkyzc_cpcCor, phasepara_const
+
 def oneDimLinearCorr_parameter(epi_kxkyzc_raw, nShot, phasepara_zp):
     """
     This function corrects Nyquist ghosts with 1D linear phase model using
@@ -147,6 +178,25 @@ def OIEntropyBasedCor_forCompile(data_kyxc, Nshot, StartPoint=None):
 
     return AfterCor, PhasePara
 
+def OCEntropyBasedCor_forCompile(data_kyxc, Nshot, StartPoint=None):
+    if StartPoint is None:
+        StartPoint = CGetStartPoint(data_kyxc, [-np.pi/3, np.pi/3], 50, Nshot)
+    
+    res = minimize(lambda x: CGetEntropy(data_kyxc, Nshot, x), StartPoint, method='Nelder-Mead')
+
+    # Check convergence
+    if res.success:
+        pass
+    else:
+        res=StartPoint
+
+    AfterCor = data_kyxc
+    for ii in range(1,Nshot):
+        AfterCor[ii::Nshot,...] = data_kyxc[ii::Nshot,...] * np.exp(1j*res[ii-1])
+
+    return AfterCor, res
+
+
 def IGetStartPoint(data_kyxc, ConRange, LinRange, Nstep, Nshot):
     ConPhase = np.linspace(ConRange[0], ConRange[1], Nstep[0]+1)
     LinPhase = np.linspace(LinRange[0], LinRange[1], Nstep[1]+1)
@@ -162,6 +212,23 @@ def IGetStartPoint(data_kyxc, ConRange, LinRange, Nstep, Nshot):
 
     return Location
 
+def CGetStartPoint(data_kyxc, Range, Nstep, Nshot):
+    Location = np.zeros((Nshot-1))
+    ConPhase = np.linspace(0, Nstep, Nstep+1)
+    ConPhase = Range[0]+ConPhase*(Range[1]-Range[0])/Nstep
+    ConPhase_try = np.zeros((Nshot-1))
+
+    for iShot in range(1,Nshot):
+        E = np.zeros((Nstep+1))
+        for i in range(Nstep+1):
+            ConPhase_try[iShot-1] = ConPhase[i]
+            E[i] = CGetEntropy(data_kyxc,Nshot,ConPhase_try)
+
+        r = np.unravel_index(np.argmin(E, axis=None), E.shape)
+        Location[iShot-1] = ConPhase[r]
+
+    return Location
+
 def OGetEntropy(data_kyxc, PhaPara=None, Nshot=None):
     if PhaPara is not None:
         x = PhaPara
@@ -169,6 +236,30 @@ def OGetEntropy(data_kyxc, PhaPara=None, Nshot=None):
         x = [0, 0]
 
     AfterCor = OIPhaseCor(data_kyxc, x, Nshot)
+
+    # Restricting the image to the central k-space for resolution reduction
+    image = fft(AfterCor[int(np.ceil(AfterCor.shape[0] / 4)):int(np.ceil(AfterCor.shape[0] * 3 / 4)),
+                        int(np.ceil(AfterCor.shape[1] / 4)):int(np.ceil(AfterCor.shape[1] * 3 / 4)), :], axis=0)
+    
+    image = np.sum(np.abs(image)**2, axis=2)
+    
+    SquareSum = np.sum(image)
+    B = np.sqrt(image) / SquareSum
+    PointwiseEntropy = B / np.log(B)
+    entropy = -np.sum(PointwiseEntropy)
+
+    return entropy
+
+def CGetEntropy(data_kyxc, Nshot=None, PhaPara=None):
+    if PhaPara is not None:
+        x = PhaPara
+    else:
+        x = np.zeros((Nshot-1))
+
+    AfterCor = data_kyxc
+
+    for ii in range(1,Nshot):
+        AfterCor[ii::Nshot,:,:] = data_kyxc[ii::Nshot,:,:]*np.exp(1j*(x[ii-1]))
 
     # Restricting the image to the central k-space for resolution reduction
     image = fft(AfterCor[int(np.ceil(AfterCor.shape[0] / 4)):int(np.ceil(AfterCor.shape[0] * 3 / 4)),
